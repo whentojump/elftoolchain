@@ -613,11 +613,13 @@ copy_content(struct elfcopy *ecp)
 static void
 update_section_group(struct elfcopy *ecp, struct section *s)
 {
+	struct section	*ms;
 	GElf_Shdr	 ish;
 	Elf_Data	*id;
 	uint32_t	*ws, *wd;
 	uint64_t	 n;
 	size_t		 ishnum;
+	int		 removed[4096];  /* Track removed section indices */
 	int		 i, j;
 
 	if (!elf_getshnum(ecp->ein, &ishnum))
@@ -655,13 +657,29 @@ update_section_group(struct elfcopy *ecp, struct section *s)
 	*wd = *ws;
 
 	/* Update the section indices. */
+	memset(removed, 0, sizeof(removed));
 	n = ish.sh_size / ish.sh_entsize;
 	for(i = 1, j = 1; (uint64_t)i < n; i++) {
 		if (ws[i] != SHN_UNDEF && ws[i] < ishnum &&
 		    ecp->secndx[ws[i]] != 0)
 			wd[j++] = ecp->secndx[ws[i]];
-		else
+		else {
 			s->sz -= 4;
+			/* Remember this section was removed from the group */
+			if (ws[i] < sizeof(removed)/sizeof(removed[0]))
+				removed[ws[i]] = 1;
+		}
+	}
+
+	/*
+	 * Clear SHF_GROUP flag for sections removed from the group.
+	 * Otherwise they become "orphaned" with the flag but not in any group.
+	 */
+	TAILQ_FOREACH(ms, &ecp->v_sec, sec_list) {
+		size_t ndx;
+		if (ms->is && (ndx = elf_ndxscn(ms->is)) < sizeof(removed)/sizeof(removed[0]) &&
+		    removed[ndx])
+			ms->flags &= ~SHF_GROUP;
 	}
 
 	s->nocopy = 1;
