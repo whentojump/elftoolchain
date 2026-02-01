@@ -558,6 +558,18 @@ void
 copy_content(struct elfcopy *ecp)
 {
 	struct section *s;
+	unsigned char *in_group;
+	size_t max_ndx;
+
+	/* Allocate array to track which input sections are in output groups. */
+	max_ndx = 0;
+	TAILQ_FOREACH(s, &ecp->v_sec, sec_list) {
+		size_t ndx;
+		if (s->is && (ndx = elf_ndxscn(s->is)) > max_ndx)
+			max_ndx = ndx;
+	}
+	if ((in_group = calloc(max_ndx + 1, sizeof(unsigned char))) == NULL)
+		err(EXIT_FAILURE, "calloc failed");
 
 	TAILQ_FOREACH(s, &ecp->v_sec, sec_list) {
 		/* Skip pseudo section. */
@@ -603,6 +615,64 @@ copy_content(struct elfcopy *ecp)
 		if (is_print_section(ecp, s->name))
 			print_section(s);
 	}
+
+	/*
+	 * Second pass: Mark all sections that are members of output GROUP sections.
+	 * Then clear SHF_GROUP from any section not in any group.
+	 */
+	TAILQ_FOREACH(s, &ecp->v_sec, sec_list) {
+		Elf_Data *id;
+		GElf_Shdr ish;
+		uint32_t *grp_members;
+		uint64_t n;
+		int i;
+
+		if (s->type != SHT_GROUP || s->nocopy)
+			continue;
+
+		/* Read the modified group data we created in update_section_group(). */
+		if (s->buf != NULL) {
+			/* We modified this group, use our buffer. */
+			grp_members = (uint32_t *)s->buf;
+			n = s->sz / 4;
+		} else {
+			/* Group wasn't modified, read original. */
+			if (gelf_getshdr(s->is, &ish) == NULL)
+				continue;
+			if ((id = elf_getdata(s->is, NULL)) == NULL)
+				continue;
+			grp_members = (uint32_t *)id->d_buf;
+			n = ish.sh_size / (ish.sh_entsize ? ish.sh_entsize : 4);
+		}
+
+		/* Skip the flags word, mark member sections. */
+		for (i = 1; (uint64_t)i < n; i++) {
+			uint32_t member_idx = grp_members[i];
+			struct section *ms;
+
+			/* Find the section with this output index. */
+			TAILQ_FOREACH(ms, &ecp->v_sec, sec_list) {
+				if (ms->os && elf_ndxscn(ms->os) == member_idx) {
+					size_t input_ndx;
+					if (ms->is && (input_ndx = elf_ndxscn(ms->is)) <= max_ndx)
+						in_group[input_ndx] = 1;
+					break;
+				}
+			}
+		}
+	}
+
+	/* Clear SHF_GROUP from sections not in any output group. */
+	TAILQ_FOREACH(s, &ecp->v_sec, sec_list) {
+		size_t ndx;
+		if (s->is && (s->flags & SHF_GROUP)) {
+			ndx = elf_ndxscn(s->is);
+			if (ndx <= max_ndx && !in_group[ndx])
+				s->flags &= ~SHF_GROUP;
+		}
+	}
+
+	free(in_group);
 }
 
 
@@ -1182,6 +1252,9 @@ copy_shdr(struct elfcopy *ecp, struct section *s, const char *name, int copy,
 		}
 	}
 
+	/* Keep s->flags in sync with what we write to output. */
+	s->flags = osh.sh_flags;
+
 	if (name == NULL)
 		add_to_shstrtab(ecp, s->name);
 	else
@@ -1376,6 +1449,9 @@ update_shdr(struct elfcopy *ecp, int update_link)
 		/* Find section name in string table and set sh_name. */
 		osh.sh_name = elftc_string_table_lookup(ecp->shstrtab->strtab,
 		    s->name);
+
+		/* Update flags in case they were modified (e.g., SHF_GROUP cleared). */
+		osh.sh_flags = s->flags;
 
 		/*
 		 * sh_link needs to be updated, since the index of the
